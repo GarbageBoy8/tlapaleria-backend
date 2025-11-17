@@ -12,8 +12,11 @@ const app = express();
 // ✅ Configuración de CORS para permitir tu frontend de Vercel
 app.use(cors({
   origin: [
-    'https://tlapaleria-stanley2.vercel.app', // dominio desplegado en Vercel
-    'http://localhost:3000' // opcional: para pruebas locales
+    'https://tlapaleria-stanley.vercel.app',  // dominio principal en Vercel
+    'https://tlapaleria-stanley2.vercel.app', // dominio alternativo en Vercel
+    'http://localhost:3000',                   // opcional: para pruebas locales
+    'http://127.0.0.1:8080',                   // Frontend local
+    'http://localhost:8080'                   // Alternativa local
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   credentials: true
@@ -21,17 +24,40 @@ app.use(cors({
 
 app.use(express.json());
 
-// 🔌 Crear pool de conexiones MySQL (mejor que una conexión única)
-const db = mysql.createPool({
-  host: process.env.DB_HOST,         // Host de Clever Cloud
-  user: process.env.DB_USER,         // Usuario
-  password: process.env.DB_PASSWORD, // Contraseña
-  database: process.env.DB_NAME,     // Nombre de la base de datos
-  port: process.env.DB_PORT || 3306, // Puerto
-  connectionLimit: 10                // Máximo de conexiones simultáneas
-});
+// 🧠 Función para crear pool de MySQL (reutilizable en caso de error)
+let db;
+function createPool() {
+  db = mysql.createPool({
+    host: process.env.DB_HOST,         // Host de Clever Cloud
+    user: process.env.DB_USER,         // Usuario
+    password: process.env.DB_PASSWORD, // Contraseña
+    database: process.env.DB_NAME,     // Nombre de la base de datos
+    port: process.env.DB_PORT || 3306, // Puerto
+    connectionLimit: 10,               // Máximo de conexiones simultáneas
+    waitForConnections: true,          // Espera si no hay conexiones disponibles
+    queueLimit: 0                      // Sin límite de cola
+  });
 
-// 🚀 Probar la conexión inicial al iniciar el servidor
+  console.log('🔁 Pool de conexiones MySQL creado');
+
+  // 🚨 Manejador de errores del pool
+  db.on('error', (err) => {
+    console.error('⚠️ Error en el pool MySQL:', err.code);
+    if (
+      err.code === 'PROTOCOL_CONNECTION_LOST' ||
+      err.code === 'ECONNRESET' ||
+      err.code === 'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR'
+    ) {
+      console.log('♻️ Reiniciando pool de MySQL...');
+      createPool();
+    }
+  });
+}
+
+// 🧩 Crear el pool por primera vez
+createPool();
+
+// 🚀 Probar conexión inicial
 db.getConnection((err, connection) => {
   if (err) {
     console.error('❌ Error al conectar con MySQL:', err);
@@ -41,13 +67,22 @@ db.getConnection((err, connection) => {
   }
 });
 
+// 💓 Mantener conexión viva (ping cada 5 minutos)
+setInterval(() => {
+  db.query('SELECT 1', (err) => {
+    if (err) {
+      console.error('⚠️ Error en ping a MySQL:', err.code);
+    } else {
+      console.log('💓 Conexión MySQL activa (ping exitoso)');
+    }
+  });
+}, 5 * 60 * 1000); // cada 5 min
+
 // 📥 Ruta para registrar usuarios
 app.post("/register", (req, res) => {
   console.log("📥 Datos recibidos en registro:", req.body);
-
   const { nombre, usuario, correo, password } = req.body;
 
-  // Validación de campos vacíos
   if (!nombre?.trim() || !usuario?.trim() || !correo?.trim() || !password?.trim()) {
     return res.status(400).json({ error: "Faltan datos o hay campos vacíos" });
   }
@@ -57,51 +92,188 @@ app.post("/register", (req, res) => {
     VALUES (?, ?, ?, ?)
   `;
 
-  db.query(sql, [nombre, usuario, correo, password], (err, result) => {
+  db.getConnection((err, connection) => {
     if (err) {
-      console.error("❌ Error al insertar en la base de datos:", err);
-
-      if (err.code === "ER_DUP_ENTRY") {
-        return res.status(409).json({ error: "El usuario o correo ya existe" });
-      }
-
-      return res.status(500).json({ error: "Error al guardar en la base de datos" });
+      console.error("❌ Error al obtener conexión:", err);
+      return res.status(500).json({ error: "Error de conexión con la base de datos" });
     }
 
-    console.log("✅ Usuario insertado con ID:", result.insertId);
-    res.status(201).json({
-      message: "✅ Usuario guardado correctamente",
-      id: result.insertId,
+    connection.query(sql, [nombre, usuario, correo, password], (err, result) => {
+      connection.release(); // ✅ Liberar conexión
+
+      if (err) {
+        console.error("❌ Error al insertar en la base de datos:", err);
+        if (err.code === "ER_DUP_ENTRY") {
+          return res.status(409).json({ error: "El usuario o correo ya existe" });
+        }
+        return res.status(500).json({ error: "Error al guardar en la base de datos" });
+      }
+
+      console.log("✅ Usuario insertado con ID:", result.insertId);
+      res.status(201).json({
+        message: "✅ Usuario guardado correctamente",
+        id: result.insertId,
+      });
     });
   });
 });
 
-// 📥 Ruta para verificar inicio de sesión
+// ================================================================
+// 📥 Ruta para verificar inicio de sesión (MODIFICADA)
+// ================================================================
 app.post('/verify', (req, res) => {
   console.log("📥 Intento de inicio de sesión:", req.body);
-
   const { usuario, password } = req.body;
 
   if (!usuario || !password) {
     return res.status(400).json({ error: 'Faltan datos' });
   }
 
-  const sql = 'SELECT * FROM crtusuarios WHERE usuario = ? AND password = ?';
-  db.query(sql, [usuario, password], (err, results) => {
+  // Seleccionamos solo los datos que necesitamos, NUNCA la contraseña
+  const sql = 'SELECT id, nombre, usuario, correo FROM crtusuarios WHERE usuario = ? AND password = ?';
+
+  db.getConnection((err, connection) => {
     if (err) {
-      console.error('❌ Error en la consulta:', err);
-      return res.status(500).json({ error: 'Error interno del servidor' });
+      console.error('❌ Error al obtener conexión:', err);
+      return res.status(500).json({ error: 'Error de conexión con la base de datos' });
     }
 
-    if (results.length > 0) {
-      console.log(`✅ Inicio de sesión exitoso: ${usuario}`);
-      res.json({ message: '✅ Inicio de sesión exitoso' });
-    } else {
-      console.log('❌ Usuario o contraseña incorrectos');
-      res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
-    }
+    connection.query(sql, [usuario, password], (err, results) => {
+      connection.release(); // ✅ Liberar conexión
+
+      if (err) {
+        console.error('❌ Error en la consulta:', err);
+        return res.status(500).json({ error: 'Error interno del servidor' });
+      }
+
+      if (results.length > 0) {
+        console.log(`✅ Inicio de sesión exitoso: ${usuario}`);
+        
+        // ¡CAMBIO CLAVE! Enviamos el objeto de usuario al frontend
+        res.json({ 
+            message: '✅ Inicio de sesión exitoso',
+            usuario: results[0] // Contiene { id, nombre, usuario, correo }
+        });
+      
+      } else {
+        console.log('❌ Usuario o contraseña incorrectos');
+        res.status(401).json({ error: 'Usuario o contraseña incorrectos' });
+      }
+    });
   });
 });
+
+
+// ================================================================
+// 🛒 RUTAS DEL CARRITO DE COMPRAS (AÑADIDAS)
+// ================================================================
+
+/**
+ * 1. OBTENER el carrito de un usuario
+ * Se usa un JOIN para traer los datos del producto (nombre, precio, etc.)
+ */
+app.get('/carrito/:id_usuario', (req, res) => {
+  const { id_usuario } = req.params;
+  
+  // Asegúrate de que tu tabla 'productos' tenga una columna para la imagen (ej: 'imagen_url')
+  // Si no la tiene, quita 'p.imagen_url' de la consulta.
+  const sql = `
+    SELECT 
+      c.id_producto,
+      c.cantidad,
+      p.nombre,
+      p.precio,
+      p.imagen_url  -- CAMBIA ESTO si tu columna de imagen se llama diferente
+    FROM carrito c
+    JOIN productos p ON c.id_producto = p.id_producto
+    WHERE c.id_usuario = ?
+  `;
+  
+  db.getConnection((err, connection) => {
+    if (err) {
+      console.error('❌ Error al obtener conexión:', err);
+      return res.status(500).json({ error: 'Error de conexión' });
+    }
+    
+    connection.query(sql, [id_usuario], (err, results) => {
+      connection.release();
+      if (err) {
+        console.error('❌ Error en la consulta GET carrito:', err);
+        return res.status(500).json({ error: 'Error interno' });
+      }
+      res.json(results);
+    });
+  });
+});
+
+/**
+ * 2. AGREGAR un producto al carrito
+ * Usa "ON DUPLICATE KEY UPDATE" para sumar la cantidad si el producto ya existe.
+ */
+app.post('/carrito/agregar', (req, res) => {
+  const { id_usuario, id_producto, cantidad } = req.body;
+
+  if (!id_usuario || !id_producto || !cantidad) {
+    return res.status(400).json({ error: 'Faltan datos (usuario, producto, cantidad)' });
+  }
+
+  // Esta consulta inserta O actualiza si la llave (id_usuario, id_producto) ya existe
+  const sql = `
+    INSERT INTO carrito (id_usuario, id_producto, cantidad)
+    VALUES (?, ?, ?)
+    ON DUPLICATE KEY UPDATE cantidad = cantidad + VALUES(cantidad)
+  `;
+
+  db.getConnection((err, connection) => {
+    if (err) {
+      console.error('❌ Error al obtener conexión:', err);
+      return res.status(500).json({ error: 'Error de conexión' });
+    }
+
+    connection.query(sql, [id_usuario, id_producto, cantidad], (err, result) => {
+      connection.release();
+      if (err) {
+        console.error('❌ Error al agregar al carrito:', err);
+        return res.status(500).json({ error: 'Error al agregar' });
+      }
+      res.status(201).json({ message: 'Producto agregado al carrito', affectedRows: result.affectedRows });
+    });
+  });
+});
+
+/**
+ * 3. VACIAR el carrito de un usuario
+ */
+app.post('/carrito/vaciar', (req, res) => {
+  const { id_usuario } = req.body;
+
+  if (!id_usuario) {
+    return res.status(400).json({ error: 'Falta id_usuario' });
+  }
+
+  const sql = 'DELETE FROM carrito WHERE id_usuario = ?';
+
+  db.getConnection((err, connection) => {
+    if (err) {
+      console.error('❌ Error al obtener conexión:', err);
+      return res.status(500).json({ error: 'Error de conexión' });
+    }
+
+    connection.query(sql, [id_usuario], (err, result) => {
+      connection.release();
+      if (err) {
+        console.error('❌ Error al vaciar carrito:', err);
+        return res.status(500).json({ error: 'Error al vaciar' });
+      }
+      res.json({ message: 'Carrito vaciado exitosamente' });
+    });
+  });
+});
+
+
+// ================================================================
+// RUTAS DE VERIFICACIÓN (SIN CAMBIOS)
+// ================================================================
 
 // 🌐 Ruta raíz para verificar el estado del servidor
 app.get('/', (req, res) => {
